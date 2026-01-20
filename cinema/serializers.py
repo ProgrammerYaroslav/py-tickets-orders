@@ -1,39 +1,26 @@
-from django.db import transaction
 from rest_framework import serializers
-from rest_framework.exceptions import ValidationError
-
-from cinema.models import (
+from django.db import transaction
+from .models import (
+    CinemaHall,
     Genre,
     Actor,
-    CinemaHall,
     Movie,
     MovieSession,
-    Ticket,
     Order,
+    Ticket
 )
 
-# ... (Existing Movie, Actor, Genre, CinemaHall serializers) ...
+# --- Helper Serializers ---
+
+class TicketSeatSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Ticket
+        fields = ("row", "seat")
 
 class MovieSessionSerializer(serializers.ModelSerializer):
     movie_title = serializers.CharField(source="movie.title", read_only=True)
     cinema_hall_name = serializers.CharField(source="cinema_hall.name", read_only=True)
-    cinema_hall_capacity = serializers.IntegerField(
-        source="cinema_hall.capacity", read_only=True
-    )
-
-    class Meta:
-        model = MovieSession
-        fields = (
-            "id",
-            "show_time",
-            "movie_title",
-            "cinema_hall_name",
-            "cinema_hall_capacity",
-        )
-
-
-class MovieSessionListSerializer(MovieSessionSerializer):
-    # Field for the calculated available tickets
+    cinema_hall_capacity = serializers.IntegerField(source="cinema_hall.capacity", read_only=True)
     tickets_available = serializers.IntegerField(read_only=True)
 
     class Meta:
@@ -47,64 +34,83 @@ class MovieSessionListSerializer(MovieSessionSerializer):
             "tickets_available",
         )
 
+# --- Movie Session Details ---
+
+class MovieSerializer(serializers.ModelSerializer):
+    genres = serializers.SlugRelatedField(many=True, read_only=True, slug_field="name")
+    actors = serializers.SlugRelatedField(many=True, read_only=True, slug_field="full_name")
+
+    class Meta:
+        model = Movie
+        fields = ("id", "title", "description", "duration", "genres", "actors")
+
+class CinemaHallSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = CinemaHall
+        fields = ("id", "name", "rows", "seats_in_row", "capacity")
+
+class MovieSessionDetailSerializer(MovieSessionSerializer):
+    movie = MovieSerializer(read_only=True)
+    cinema_hall = CinemaHallSerializer(read_only=True)
+    taken_places = TicketSeatSerializer(source="tickets", many=True, read_only=True)
+
+    class Meta:
+        model = MovieSession
+        fields = (
+            "id",
+            "show_time",
+            "movie",
+            "cinema_hall",
+            "taken_places",
+        )
+
+# --- Orders and Tickets ---
 
 class TicketSerializer(serializers.ModelSerializer):
-    """
-    Serializer for listing tickets inside an Order.
-    Includes nested movie_session details.
-    """
+    # For nested output in Order list
     movie_session = MovieSessionSerializer(read_only=True)
 
     class Meta:
         model = Ticket
         fields = ("id", "row", "seat", "movie_session")
 
-
 class TicketCreateSerializer(serializers.ModelSerializer):
-    """
-    Serializer specifically for creating tickets via POST.
-    Validates seat availability.
-    """
+    # For input during Order creation
     class Meta:
         model = Ticket
         fields = ("row", "seat", "movie_session")
 
-class OrderSerializer(serializers.ModelSerializer):
-    # ... existing fields ...
-
     def validate(self, attrs):
-        # Retrieve tickets from initial_data (raw input)
-        tickets_data = self.initial_data.get("tickets")
+        data = super(TicketCreateSerializer, self).validate(attrs)
+        # Check if the seat is already taken for this session
+        if Ticket.objects.filter(
+            movie_session=attrs["movie_session"],
+            row=attrs["row"],
+            seat=attrs["seat"]
+        ).exists():
+            raise serializers.ValidationError({
+                "ticket": f"The ticket for row {attrs['row']} and seat {attrs['seat']} is already sold."
+            })
+        return data
 
-        # 1. Check presence
-        if not tickets_data:
-            raise serializers.ValidationError(
-                {"tickets": "This field is required."}
-            )
+class OrderSerializer(serializers.ModelSerializer):
+    tickets = TicketSerializer(many=True, read_only=True)
+    created_at = serializers.DateTimeField(format="%Y-%m-%dT%H:%M:%S.%fZ", read_only=True)
 
-        # 2. Check type (must be a list)
-        if not isinstance(tickets_data, list):
-            raise serializers.ValidationError(
-                {"tickets": "This field must be a list."}
-            )
-
-        # 3. Check emptiness (optional based on spec, but recommended by reviewer)
-        if len(tickets_data) == 0:
-            raise serializers.ValidationError(
-                {"tickets": "Order must contain at least one ticket."}
-            )
-
-        return attrs
+    class Meta:
+        model = Order
+        fields = ("id", "tickets", "created_at")
 
     def create(self, validated_data):
-        # Now it is safe to fetch tickets, as validate() has passed
-        tickets_data = self.initial_data.get("tickets")
-        
         with transaction.atomic():
+            tickets_data = self.initial_data.get("tickets")
             order = Order.objects.create(**validated_data)
-            for ticket_data in tickets_data:
-                TicketCreateSerializer(data=ticket_data).is_valid(raise_exception=True)
-                Ticket.objects.create(order=order, **ticket_data)
-                # Or use the serializer .save() if preferred
+            
+            if tickets_data:
+                for ticket_data in tickets_data:
+                    # Validate each ticket individually using the Create Serializer
+                    ticket_serializer = TicketCreateSerializer(data=ticket_data)
+                    ticket_serializer.is_valid(raise_exception=True)
+                    ticket_serializer.save(order=order)
             
             return order
